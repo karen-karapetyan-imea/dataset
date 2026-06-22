@@ -3,6 +3,15 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Large crawler data
+dataset/html-crawler/state/urls_saatchiart.txt
+dataset/crawler_backup/results.jsonl
+
+# Optional - ignore all crawler state/data
+dataset/html-crawler/state/
+dataset/crawler_backup/
+
+
 # C extensions
 *.so
 
