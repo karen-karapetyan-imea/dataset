@@ -25,7 +25,7 @@ source "$(dirname "$0")/_artsper_sync_env.sh"
 artsper_sync_root
 artsper_sync_load_env
 
-STATE_DIR="${STATE_DIR:-state}"
+STATE_DIR="${STATE_DIR:-state/saatchi}"
 ARTWORKS_JSONL="${ARTWORKS_JSONL:-$STATE_DIR/saatchi_artworks.jsonl}"
 ARTISTS_JSONL="${ARTISTS_JSONL:-$STATE_DIR/saatchi_artists.jsonl}"
 FAILURES_JSONL="${FAILURES_JSONL:-$STATE_DIR/saatchi_parse_failures.jsonl}"

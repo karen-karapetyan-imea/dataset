@@ -17,6 +17,12 @@ except ImportError:  # pragma: no cover
 
 from etl.artsper import extract_artist_record, extract_artwork_record
 from etl.urls import artsper_entity_from_url
+from etl.versioning import (
+    VersionOutcome,
+    apply_versioned_upsert,
+    preload_snapshots,
+    tracked_fields_for,
+)
 from mapping_utils import iter_mapping_rows, iter_url_list_rows
 
 LOGGER = logging.getLogger(__name__)
@@ -67,6 +73,7 @@ class LegacyImportStats:
     scanned: int = 0
     inserted: int = 0
     updated: int = 0
+    versioned: int = 0
     skipped: int = 0
     failed: int = 0
 
@@ -174,6 +181,38 @@ def upsert_row(cursor: Any, entity_type: str, row: dict[str, Any]) -> str:
     return "inserted" if inserted else "updated"
 
 
+def _collect_legacy_ids(
+    row_iter: Iterator[tuple[str, str, int]],
+) -> tuple[set[str], set[str]]:
+    artist_ids: set[str] = set()
+    artwork_ids: set[str] = set()
+    for url, _filename, _status in row_iter:
+        entity = artsper_entity_from_url(url)
+        if entity is None:
+            continue
+        entity_type, external_id = entity
+        if entity_type == "artist":
+            artist_ids.add(str(external_id))
+        else:
+            artwork_ids.add(str(external_id))
+    return artist_ids, artwork_ids
+
+
+def _record_outcome(stats: LegacyImportStats, outcome: VersionOutcome | str, *, inserted: bool) -> None:
+    if isinstance(outcome, VersionOutcome):
+        if outcome == VersionOutcome.INSERTED:
+            stats.inserted += 1
+        elif outcome == VersionOutcome.VERSIONED:
+            stats.versioned += 1
+        else:
+            stats.skipped += 1
+        return
+    if inserted:
+        stats.inserted += 1
+    else:
+        stats.updated += 1
+
+
 def process_row(
     connection: Any | None,
     *,
@@ -182,7 +221,11 @@ def process_row(
     html_dir: Path,
     dry_run: bool,
     skip_existing: bool,
+    sync_versions: bool,
     stats: LegacyImportStats,
+    artist_snapshots: dict[str, dict[str, Any]],
+    artwork_snapshots: dict[str, dict[str, Any]],
+    sync_source: str = "weekly_cron",
 ) -> None:
     stats.scanned += 1
     if not html_path.is_file() or html_path.stat().st_size == 0:
@@ -214,16 +257,32 @@ def process_row(
 
     assert connection is not None
     try:
+        if sync_versions:
+            tracked = tracked_fields_for("artsper", entity_type)
+            snapshots = artist_snapshots if entity_type == "artist" else artwork_snapshots
+            upsert_sql = UPSERT_ARTIST_SQL if entity_type == "artist" else UPSERT_ARTWORK_SQL
+            with connection.cursor() as cursor:
+                outcome = apply_versioned_upsert(
+                    cursor,
+                    marketplace="artsper",
+                    entity_type=entity_type,
+                    row=row,
+                    upsert_sql=upsert_sql,
+                    tracked_fields=tracked,
+                    known_snapshots=snapshots,
+                    sync_source=sync_source,
+                )
+            connection.commit()
+            _record_outcome(stats, outcome, inserted=False)
+            return
+
         with connection.cursor() as cursor:
             if skip_existing and _legacy_exists(cursor, entity_type, int(external_id)):
                 stats.skipped += 1
                 return
             outcome = upsert_row(cursor, entity_type, row)
         connection.commit()
-        if outcome == "inserted":
-            stats.inserted += 1
-        else:
-            stats.updated += 1
+        _record_outcome(stats, outcome, inserted=(outcome == "inserted"))
     except Exception as exc:
         connection.rollback()
         stats.failed += 1
@@ -246,6 +305,13 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Skip rows whose Artsper id already exists in legacy tables (default: true).",
     )
+    parser.add_argument(
+        "--sync-versions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare batch rows with DB, record version history on change (weekly cron)",
+    )
+    parser.add_argument("--sync-source", default="weekly_cron")
     parser.add_argument(
         "--status-ok-only",
         action=argparse.BooleanOptionalAction,
@@ -273,6 +339,39 @@ def main() -> None:
     else:
         raise SystemExit("Provide --mapping-file or --urls-file")
 
+    sync_versions = args.sync_versions
+    artist_snapshots: dict[str, dict[str, Any]] = {}
+    artwork_snapshots: dict[str, dict[str, Any]] = {}
+    if sync_versions and not args.dry_run:
+        artist_ids, artwork_ids = _collect_legacy_ids(list(row_iter))
+        connection_pre = psycopg.connect(args.db_url)
+        try:
+            if artist_ids:
+                artist_snapshots = preload_snapshots(
+                    connection_pre,
+                    "arts_artists",
+                    artist_ids,
+                    tracked_fields_for("artsper", "artist"),
+                )
+            if artwork_ids:
+                artwork_snapshots = preload_snapshots(
+                    connection_pre,
+                    "arts_artworks",
+                    artwork_ids,
+                    tracked_fields_for("artsper", "artwork"),
+                )
+        finally:
+            connection_pre.close()
+        LOGGER.info(
+            "preloaded snapshots artists=%s artworks=%s",
+            len(artist_snapshots),
+            len(artwork_snapshots),
+        )
+        if args.urls_file is not None:
+            row_iter = iter_url_list_rows(args.urls_file, args.html_dir, require_html=True)
+        else:
+            row_iter = iter_mapping_rows(args.mapping_file)
+
     connection = None if args.dry_run else psycopg.connect(args.db_url)
     stats = LegacyImportStats()
     try:
@@ -289,15 +388,20 @@ def main() -> None:
                 html_path=args.html_dir / filename,
                 html_dir=args.html_dir,
                 dry_run=args.dry_run,
-                skip_existing=args.skip_existing,
+                skip_existing=args.skip_existing and not sync_versions,
+                sync_versions=sync_versions,
                 stats=stats,
+                artist_snapshots=artist_snapshots,
+                artwork_snapshots=artwork_snapshots,
+                sync_source=args.sync_source,
             )
             if count % 500 == 0:
                 LOGGER.info(
-                    "progress scanned=%s inserted=%s updated=%s skipped=%s failed=%s",
+                    "progress scanned=%s inserted=%s updated=%s versioned=%s skipped=%s failed=%s",
                     stats.scanned,
                     stats.inserted,
                     stats.updated,
+                    stats.versioned,
                     stats.skipped,
                     stats.failed,
                 )
@@ -305,10 +409,11 @@ def main() -> None:
         if connection is not None:
             connection.close()
     LOGGER.info(
-        "done scanned=%s inserted=%s updated=%s skipped=%s failed=%s",
+        "done scanned=%s inserted=%s updated=%s versioned=%s skipped=%s failed=%s",
         stats.scanned,
         stats.inserted,
         stats.updated,
+        stats.versioned,
         stats.skipped,
         stats.failed,
     )

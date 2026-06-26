@@ -8,9 +8,27 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlsplit, urlunsplit
 
-from etl.urls import artsper_entity_from_url
+from etl.urls import artsper_entity_from_url, entity_from_url, saatchi_entity_from_url
 
 _KATANA_JSON_URL_KEYS = ("url", "request", "endpoint", "input")
+
+_MARKETPLACE_TABLES: dict[str, dict[str, str]] = {
+    "artsper": {
+        "artist": "arts_artists",
+        "artwork": "arts_artworks",
+    },
+    "saatchi": {
+        "artist": "saatchi_artists",
+        "artwork": "saatchi_artworks",
+    },
+    "artsy": {
+        "artist": "artsy_artists",
+        "artwork": "artsy_artworks",
+        "partner": "artsy_partners",
+        "show": "artsy_shows",
+        "fair": "artsy_fairs",
+    },
+}
 
 
 def normalize_url(url: str) -> str:
@@ -28,9 +46,10 @@ def html_filename_for_url(url: str) -> str:
     return hashlib.sha1(url.encode()).hexdigest() + ".html"
 
 
-def entity_key_from_url(url: str) -> tuple[str, str] | None:
-    """Stable (entity_type, external_id) for Artsper artist/artwork URLs."""
-    return artsper_entity_from_url(normalize_url(url) or url)
+def entity_key_from_url(url: str, *, source: str = "artsper") -> tuple[str, str] | None:
+    """Stable (entity_type, external_id) for marketplace entity URLs."""
+    normalized = normalize_url(url) or url
+    return entity_from_url(normalized, source=source)
 
 
 def iter_urls_from_lines(path: Path) -> Iterator[str]:
@@ -59,7 +78,6 @@ def iter_urls_from_jsonl(path: Path) -> Iterator[str]:
                     yield value.strip()
                     break
             else:
-                # Katana sometimes nests URL in request.endpoint
                 request = row.get("request")
                 if isinstance(request, dict):
                     endpoint = request.get("endpoint")
@@ -83,34 +101,34 @@ def load_urls(paths: Iterable[Path]) -> set[str]:
     return urls
 
 
-def load_entity_keys(paths: Iterable[Path]) -> set[tuple[str, str]]:
+def load_entity_keys(paths: Iterable[Path], *, source: str = "artsper") -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     for url in load_urls(paths):
-        key = entity_key_from_url(url)
+        key = entity_key_from_url(url, source=source)
         if key is not None:
             keys.add(key)
     return keys
 
 
 def load_entity_keys_from_db(db_url: str, *, source: str = "artsper") -> set[tuple[str, str]]:
-    """Load known Artsper entity ids from legacy arts_* tables."""
-    del source  # legacy schema is Artsper-only
+    """Load known entity ids from marketplace tables."""
     try:
         import psycopg
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("psycopg is required for --known-db-url") from exc
 
+    tables = _MARKETPLACE_TABLES.get(source)
+    if tables is None:
+        raise ValueError(f"unsupported marketplace source: {source}")
+
     keys: set[tuple[str, str]] = set()
     with psycopg.connect(db_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id::text FROM public.arts_artists")
-            for (external_id,) in cursor.fetchall():
-                if external_id is not None:
-                    keys.add(("artist", str(external_id)))
-            cursor.execute("SELECT id::text FROM public.arts_artworks")
-            for (external_id,) in cursor.fetchall():
-                if external_id is not None:
-                    keys.add(("artwork", str(external_id)))
+            for entity_type, table_name in tables.items():
+                cursor.execute(f"SELECT id::text FROM public.{table_name}")
+                for (external_id,) in cursor.fetchall():
+                    if external_id is not None:
+                        keys.add((entity_type, str(external_id)))
     return keys
 
 
@@ -149,21 +167,18 @@ class UrlDiffResult:
         }
 
 
-def diff_artsper_urls(
+def diff_entity_urls(
     incoming_paths: Iterable[Path],
     *,
+    source: str = "artsper",
     known_paths: Iterable[Path] | None = None,
     known_entity_keys: set[tuple[str, str]] | None = None,
 ) -> UrlDiffResult:
-    """
-    Compare Katana (or any) URL dump against known crawl/import state.
-
-    Dedupes by Artsper entity id (artist/artwork numeric id), not raw URL string.
-    """
+    """Compare URL dump against known crawl/import state, deduped by entity id."""
     result = UrlDiffResult()
     known = set(known_entity_keys or ())
     if known_paths:
-        known |= load_entity_keys(known_paths)
+        known |= load_entity_keys(known_paths, source=source)
 
     seen_incoming: set[tuple[str, str]] = set()
     best_url_for_key: dict[tuple[str, str], str] = {}
@@ -178,7 +193,7 @@ def diff_artsper_urls(
             if not normalized:
                 continue
             result.stats.normalized_urls += 1
-            key = entity_key_from_url(normalized)
+            key = entity_key_from_url(normalized, source=source)
             if key is None:
                 result.stats.invalid_urls += 1
                 result.invalid_urls.append(normalized)
@@ -199,6 +214,20 @@ def diff_artsper_urls(
             result.new_urls.append(url)
 
     return result
+
+
+def diff_artsper_urls(
+    incoming_paths: Iterable[Path],
+    *,
+    known_paths: Iterable[Path] | None = None,
+    known_entity_keys: set[tuple[str, str]] | None = None,
+) -> UrlDiffResult:
+    return diff_entity_urls(
+        incoming_paths,
+        source="artsper",
+        known_paths=known_paths,
+        known_entity_keys=known_entity_keys,
+    )
 
 
 def write_url_list(path: Path, urls: Iterable[str]) -> int:

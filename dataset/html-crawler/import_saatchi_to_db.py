@@ -14,10 +14,27 @@ from typing import Any, Iterator
 
 try:
     import psycopg
+    from psycopg import OperationalError
     from psycopg.types.json import Jsonb
 except ImportError:  # pragma: no cover
     psycopg = None
+    OperationalError = Exception  # type: ignore[misc, assignment]
     Jsonb = None
+
+from etl.db_import import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_PROGRESS_EVERY,
+    connect_db,
+    log_progress,
+    preload_ids,
+)
+from etl.versioning import (
+    VersionOutcome,
+    apply_versioned_upsert,
+    preload_snapshots,
+    tracked_fields_for,
+)
+from mapping_utils import iter_mapping_rows
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,15 +108,13 @@ ON CONFLICT (id) DO UPDATE SET
 RETURNING (xmax = 0) AS inserted;
 """
 
-ARTIST_EXISTS_SQL = "SELECT 1 FROM public.saatchi_artists WHERE id = %s LIMIT 1;"
-ARTWORK_EXISTS_SQL = "SELECT 1 FROM public.saatchi_artworks WHERE id = %s LIMIT 1;"
-
 
 @dataclass(slots=True)
 class SaatchiImportStats:
     scanned: int = 0
     inserted: int = 0
     updated: int = 0
+    versioned: int = 0
     skipped: int = 0
     failed: int = 0
 
@@ -234,12 +249,30 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
                 yield row
 
 
-def _exists(cursor: Any, sql: str, entity_id: int) -> bool:
-    cursor.execute(sql, (entity_id,))
-    return cursor.fetchone() is not None
+def _mapping_filenames(mapping_file: Path | None) -> set[str] | None:
+    if mapping_file is None:
+        return None
+    filenames: set[str] = set()
+    for _url, filename, _status in iter_mapping_rows(mapping_file):
+        filenames.add(filename)
+    return filenames
 
 
-def _resolve_artist_fk(cursor: Any, artist_external_id: Any) -> int | None:
+def _filter_records(
+    records: Iterator[dict[str, Any]],
+    *,
+    mapping_filenames: set[str] | None,
+) -> Iterator[dict[str, Any]]:
+    if mapping_filenames is None:
+        yield from records
+        return
+    for record in records:
+        source_file = str(record.get("source_file") or "")
+        if source_file in mapping_filenames:
+            yield record
+
+
+def _resolve_artist_fk(artist_external_id: Any, known_artists: set[str]) -> int | None:
     text = _text_or_none(artist_external_id)
     if not text:
         return None
@@ -247,19 +280,84 @@ def _resolve_artist_fk(cursor: Any, artist_external_id: Any) -> int | None:
         artist_id = int(text)
     except ValueError:
         return None
-    if _exists(cursor, ARTIST_EXISTS_SQL, artist_id):
-        return artist_id
-    return None
+    return artist_id if str(artist_id) in known_artists else None
+
+
+def _upsert_row(cursor: Any, sql: str, row: dict[str, Any]) -> bool:
+    cursor.execute(sql, row)
+    result = cursor.fetchone()
+    return bool(result[0]) if result else False
+
+
+def _run_upsert(
+    connection: Any,
+    db_url: str,
+    sql: str,
+    row: dict[str, Any],
+) -> tuple[Any, bool]:
+    try:
+        with connection.cursor() as cursor:
+            inserted = _upsert_row(cursor, sql, row)
+        return connection, inserted
+    except OperationalError:
+        try:
+            connection.close()
+        except Exception:
+            pass
+        connection = connect_db(db_url)
+        with connection.cursor() as cursor:
+            inserted = _upsert_row(cursor, sql, row)
+        return connection, inserted
+
+
+def _collect_entity_ids(
+    path: Path,
+    *,
+    mapping_filenames: set[str] | None,
+    id_field: str,
+) -> set[str]:
+    ids: set[str] = set()
+    records = _filter_records(iter_jsonl(path), mapping_filenames=mapping_filenames)
+    for record in records:
+        value = record.get(id_field)
+        if value is not None:
+            ids.add(str(value))
+    return ids
+
+
+def _record_outcome(stats: SaatchiImportStats, outcome: VersionOutcome | str, *, inserted: bool) -> None:
+    if isinstance(outcome, VersionOutcome):
+        if outcome == VersionOutcome.INSERTED:
+            stats.inserted += 1
+        elif outcome == VersionOutcome.VERSIONED:
+            stats.versioned += 1
+        else:
+            stats.skipped += 1
+        return
+    if inserted:
+        stats.inserted += 1
+    else:
+        stats.updated += 1
 
 
 def import_artists(
     connection: Any,
     records: Iterator[dict[str, Any]],
     *,
+    db_url: str,
     html_dir: Path,
     skip_existing: bool,
+    sync_versions: bool,
     stats: SaatchiImportStats,
-) -> None:
+    known_artists: set[str],
+    known_snapshots: dict[str, dict[str, Any]],
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    sync_source: str = "weekly_cron",
+) -> Any:
+    pending = 0
+    tracked = tracked_fields_for("saatchi", "artist")
+
     for record in records:
         stats.scanned += 1
         try:
@@ -268,52 +366,144 @@ def import_artists(
             stats.failed += 1
             LOGGER.warning("artist row build failed: %s", exc)
             continue
+
+        entity_id = row["id"]
+        entity_key = str(entity_id)
+        if sync_versions:
+            try:
+                with connection.cursor() as cursor:
+                    outcome = apply_versioned_upsert(
+                        cursor,
+                        marketplace="saatchi",
+                        entity_type="artist",
+                        row=row,
+                        upsert_sql=UPSERT_ARTIST_SQL,
+                        tracked_fields=tracked,
+                        known_snapshots=known_snapshots,
+                        sync_source=sync_source,
+                    )
+                pending += 1
+                known_artists.add(entity_key)
+                _record_outcome(stats, outcome, inserted=False)
+                if pending >= batch_size:
+                    connection.commit()
+                    pending = 0
+            except Exception as exc:
+                connection.rollback()
+                pending = 0
+                stats.failed += 1
+                LOGGER.warning("artist import failed id=%s error=%s", entity_id, exc)
+            log_progress("artists", stats, every=progress_every)
+            continue
+
+        if skip_existing and entity_key in known_artists:
+            stats.skipped += 1
+            log_progress("artists", stats, every=progress_every)
+            continue
+
         try:
-            with connection.cursor() as cursor:
-                if skip_existing and _exists(cursor, ARTIST_EXISTS_SQL, row["id"]):
-                    stats.skipped += 1
-                    continue
-                cursor.execute(UPSERT_ARTIST_SQL, row)
-                inserted = bool(cursor.fetchone()[0])
-            connection.commit()
-            if inserted:
-                stats.inserted += 1
-            else:
-                stats.updated += 1
+            connection, inserted = _run_upsert(connection, db_url, UPSERT_ARTIST_SQL, row)
+            pending += 1
+            known_artists.add(entity_key)
+            _record_outcome(stats, "upsert", inserted=inserted)
+            if pending >= batch_size:
+                connection.commit()
+                pending = 0
         except Exception as exc:
             connection.rollback()
+            pending = 0
             stats.failed += 1
-            LOGGER.warning("artist import failed id=%s error=%s", row.get("id"), exc)
+            LOGGER.warning("artist import failed id=%s error=%s", entity_id, exc)
+
+        log_progress("artists", stats, every=progress_every)
+
+    if pending:
+        connection.commit()
+    return connection
 
 
 def import_artworks(
     connection: Any,
     records: Iterator[dict[str, Any]],
     *,
+    db_url: str,
     html_dir: Path,
     skip_existing: bool,
+    sync_versions: bool,
     stats: SaatchiImportStats,
-) -> None:
+    known_artworks: set[str],
+    known_artists: set[str],
+    known_snapshots: dict[str, dict[str, Any]],
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_every: int = DEFAULT_PROGRESS_EVERY,
+    sync_source: str = "weekly_cron",
+) -> Any:
+    pending = 0
+    tracked = tracked_fields_for("saatchi", "artwork")
+
     for record in records:
         stats.scanned += 1
         try:
-            with connection.cursor() as cursor:
-                artist_fk = _resolve_artist_fk(cursor, record.get("artist_external_id"))
-                row = build_artwork_row(record, html_dir=html_dir, artist_id_fk=artist_fk)
-                if skip_existing and _exists(cursor, ARTWORK_EXISTS_SQL, row["id"]):
-                    stats.skipped += 1
-                    continue
-                cursor.execute(UPSERT_ARTWORK_SQL, row)
-                inserted = bool(cursor.fetchone()[0])
-            connection.commit()
-            if inserted:
-                stats.inserted += 1
-            else:
-                stats.updated += 1
+            artist_fk = _resolve_artist_fk(record.get("artist_external_id"), known_artists)
+            row = build_artwork_row(record, html_dir=html_dir, artist_id_fk=artist_fk)
+        except (ValueError, TypeError) as exc:
+            stats.failed += 1
+            LOGGER.warning("artwork row build failed: %s", exc)
+            continue
+
+        entity_id = row["id"]
+        entity_key = str(entity_id)
+        if sync_versions:
+            try:
+                with connection.cursor() as cursor:
+                    outcome = apply_versioned_upsert(
+                        cursor,
+                        marketplace="saatchi",
+                        entity_type="artwork",
+                        row=row,
+                        upsert_sql=UPSERT_ARTWORK_SQL,
+                        tracked_fields=tracked,
+                        known_snapshots=known_snapshots,
+                        sync_source=sync_source,
+                    )
+                pending += 1
+                known_artworks.add(entity_key)
+                _record_outcome(stats, outcome, inserted=False)
+                if pending >= batch_size:
+                    connection.commit()
+                    pending = 0
+            except Exception as exc:
+                connection.rollback()
+                pending = 0
+                stats.failed += 1
+                LOGGER.warning("artwork import failed id=%s error=%s", entity_id, exc)
+            log_progress("artworks", stats, every=progress_every)
+            continue
+
+        if skip_existing and entity_key in known_artworks:
+            stats.skipped += 1
+            log_progress("artworks", stats, every=progress_every)
+            continue
+
+        try:
+            connection, inserted = _run_upsert(connection, db_url, UPSERT_ARTWORK_SQL, row)
+            pending += 1
+            known_artworks.add(entity_key)
+            _record_outcome(stats, "upsert", inserted=inserted)
+            if pending >= batch_size:
+                connection.commit()
+                pending = 0
         except Exception as exc:
             connection.rollback()
+            pending = 0
             stats.failed += 1
-            LOGGER.warning("artwork import failed id=%s error=%s", record.get("artwork_id"), exc)
+            LOGGER.warning("artwork import failed id=%s error=%s", entity_id, exc)
+
+        log_progress("artworks", stats, every=progress_every)
+
+    if pending:
+        connection.commit()
+    return connection
 
 
 def parse_args() -> argparse.Namespace:
@@ -322,12 +512,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--html-dir", type=Path, required=True)
     parser.add_argument("--artists-jsonl", type=Path, default=None)
     parser.add_argument("--artworks-jsonl", type=Path, default=None)
+    parser.add_argument("--mapping-file", type=Path, default=None, help="Only import JSONL rows for these crawl filenames")
     parser.add_argument(
         "--skip-existing",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument(
+        "--sync-versions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compare batch rows with DB, record version history on change (weekly cron)",
+    )
+    parser.add_argument("--sync-source", default="weekly_cron")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--progress-every", type=int, default=DEFAULT_PROGRESS_EVERY)
     return parser.parse_args()
 
 
@@ -339,27 +539,74 @@ def main() -> None:
     if not args.artists_jsonl and not args.artworks_jsonl:
         raise SystemExit("Provide --artists-jsonl and/or --artworks-jsonl")
 
-    connection = psycopg.connect(args.db_url)
+    mapping_filenames = _mapping_filenames(args.mapping_file)
+    sync_versions = args.sync_versions
+    if sync_versions and mapping_filenames is None:
+        LOGGER.warning("sync-versions without --mapping-file processes entire JSONL (slow on large files)")
+
+    connection = connect_db(args.db_url)
+    known_artists = preload_ids(connection, "saatchi_artists")
+    known_artworks = preload_ids(connection, "saatchi_artworks")
+    LOGGER.info("preloaded known artists=%s artworks=%s", len(known_artists), len(known_artworks))
+
+    artist_snapshots: dict[str, dict[str, Any]] = {}
+    artwork_snapshots: dict[str, dict[str, Any]] = {}
+    if sync_versions and args.artists_jsonl and args.artists_jsonl.is_file():
+        artist_ids = _collect_entity_ids(
+            args.artists_jsonl,
+            mapping_filenames=mapping_filenames,
+            id_field="artist_external_id",
+        )
+        artist_snapshots = preload_snapshots(
+            connection,
+            "saatchi_artists",
+            artist_ids,
+            tracked_fields_for("saatchi", "artist"),
+        )
+        LOGGER.info("preloaded artist snapshots=%s", len(artist_snapshots))
+    if sync_versions and args.artworks_jsonl and args.artworks_jsonl.is_file():
+        artwork_ids = _collect_entity_ids(
+            args.artworks_jsonl,
+            mapping_filenames=mapping_filenames,
+            id_field="artwork_id",
+        )
+        artwork_snapshots = preload_snapshots(
+            connection,
+            "saatchi_artworks",
+            artwork_ids,
+            tracked_fields_for("saatchi", "artwork"),
+        )
+        LOGGER.info("preloaded artwork snapshots=%s", len(artwork_snapshots))
+
     try:
         if args.artists_jsonl:
             if not args.artists_jsonl.is_file():
                 raise SystemExit(f"artists jsonl not found: {args.artists_jsonl}")
             records = iter_jsonl(args.artists_jsonl)
+            records = _filter_records(records, mapping_filenames=mapping_filenames)
             if args.limit is not None:
                 records = (row for index, row in enumerate(records) if index < args.limit)
             artist_stats = SaatchiImportStats()
-            import_artists(
+            connection = import_artists(
                 connection,
                 records,
+                db_url=args.db_url,
                 html_dir=args.html_dir,
-                skip_existing=args.skip_existing,
+                skip_existing=args.skip_existing and not sync_versions,
+                sync_versions=sync_versions,
                 stats=artist_stats,
+                known_artists=known_artists,
+                known_snapshots=artist_snapshots,
+                batch_size=args.batch_size,
+                progress_every=args.progress_every,
+                sync_source=args.sync_source,
             )
             LOGGER.info(
-                "artists done scanned=%s inserted=%s updated=%s skipped=%s failed=%s",
+                "artists done scanned=%s inserted=%s updated=%s versioned=%s skipped=%s failed=%s",
                 artist_stats.scanned,
                 artist_stats.inserted,
                 artist_stats.updated,
+                artist_stats.versioned,
                 artist_stats.skipped,
                 artist_stats.failed,
             )
@@ -368,21 +615,31 @@ def main() -> None:
             if not args.artworks_jsonl.is_file():
                 raise SystemExit(f"artworks jsonl not found: {args.artworks_jsonl}")
             records = iter_jsonl(args.artworks_jsonl)
+            records = _filter_records(records, mapping_filenames=mapping_filenames)
             if args.limit is not None:
                 records = (row for index, row in enumerate(records) if index < args.limit)
             artwork_stats = SaatchiImportStats()
-            import_artworks(
+            connection = import_artworks(
                 connection,
                 records,
+                db_url=args.db_url,
                 html_dir=args.html_dir,
-                skip_existing=args.skip_existing,
+                skip_existing=args.skip_existing and not sync_versions,
+                sync_versions=sync_versions,
                 stats=artwork_stats,
+                known_artworks=known_artworks,
+                known_artists=known_artists,
+                known_snapshots=artwork_snapshots,
+                batch_size=args.batch_size,
+                progress_every=args.progress_every,
+                sync_source=args.sync_source,
             )
             LOGGER.info(
-                "artworks done scanned=%s inserted=%s updated=%s skipped=%s failed=%s",
+                "artworks done scanned=%s inserted=%s updated=%s versioned=%s skipped=%s failed=%s",
                 artwork_stats.scanned,
                 artwork_stats.inserted,
                 artwork_stats.updated,
+                artwork_stats.versioned,
                 artwork_stats.skipped,
                 artwork_stats.failed,
             )

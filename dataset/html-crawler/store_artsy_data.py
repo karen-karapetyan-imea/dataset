@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse local Saatchi HTML files and write artwork/artist JSONL extracts."""
+"""Parse local Artsy HTML files and write entity JSONL extracts."""
 
 from __future__ import annotations
 
@@ -10,49 +10,45 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from etl.saatchi import (
-    extract_artist_record,
-    extract_artwork_record,
-    route_saatchi_page,
-)
+from etl.artsy import EXTRACTORS, route_artsy_page
 from mapping_utils import iter_mapping_rows
 
 
-def _load_resume_keys(path: Path) -> set[str]:
+def _load_resume_keys(*paths: Path) -> set[str]:
     keys: set[str] = set()
-    if not path.is_file():
-        return keys
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            source_file = row.get("source_file")
-            if source_file:
-                keys.add(str(source_file))
+    for path in paths:
+        if not path.is_file():
+            continue
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                source_file = row.get("source_file")
+                if source_file:
+                    keys.add(str(source_file))
     return keys
 
 
-def _process_file(args: tuple[str, str, str]) -> dict[str, Any]:
-    file_path_str, entity_filter, _data_dir = args
+def _process_file(args: tuple[str, str, str, str]) -> dict[str, Any]:
+    file_path_str, entity_filter, data_dir, default_url = args
     path = Path(file_path_str)
     try:
         html = path.read_text(encoding="utf-8", errors="replace")
-        page_type = route_saatchi_page(html)
+        page_type = route_artsy_page(html, default_url or None)
         if page_type is None:
             return {"status": "skip", "source_file": path.name, "reason": "unknown_page_type"}
         if entity_filter != "all" and page_type != entity_filter:
             return {"status": "skip", "source_file": path.name, "reason": "entity_filter"}
 
-        if page_type == "artwork":
-            record, missing = extract_artwork_record(path)
-        else:
-            record, missing = extract_artist_record(path)
-
+        extractor = EXTRACTORS.get(page_type)
+        if extractor is None:
+            return {"status": "skip", "source_file": path.name, "reason": "no_extractor"}
+        record, missing = extractor(path, default_url or None)
         if missing:
             return {
                 "status": "missing",
@@ -66,38 +62,17 @@ def _process_file(args: tuple[str, str, str]) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Extract Saatchi artwork and artist metadata from HTML files."
-    )
-    parser.add_argument("--data-dir", required=True, help="Directory of sha1.html files")
-    parser.add_argument(
-        "--output-artworks",
-        default="state/saatchi_artworks.jsonl",
-        help="JSONL output for artwork records",
-    )
-    parser.add_argument(
-        "--output-artists",
-        default="state/saatchi_artists.jsonl",
-        help="JSONL output for artist records",
-    )
-    parser.add_argument(
-        "--failures",
-        default="state/saatchi_parse_failures.jsonl",
-        help="JSONL output for parse failures",
-    )
+    parser = argparse.ArgumentParser(description="Extract Artsy metadata from HTML files.")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--state-dir", default="state/artsy")
     parser.add_argument(
         "--entity",
-        choices=("all", "artwork", "artist"),
+        choices=("all", "artwork", "artist", "partner", "show", "fair"),
         default="all",
-        help="Only extract matching page types",
     )
-    parser.add_argument("--workers", type=int, default=None, help="Process pool size")
-    parser.add_argument("--limit", type=int, default=0, help="Parse at most N files (0 = all)")
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Skip source_file values already present in output JSONL files",
-    )
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--mapping-file",
         type=Path,
@@ -109,27 +84,36 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --mapping-file, re-extract mapped files even if already in JSONL",
     )
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        help="Write to artsy_{entity}s{suffix}.jsonl (e.g. _batch)",
+    )
     return parser
+
+
+def _output_path(state_dir: Path, entity: str, suffix: str = "") -> Path:
+    return state_dir / f"artsy_{entity}s{suffix}.jsonl"
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     data_dir = Path(args.data_dir)
-    if not data_dir.is_dir():
-        raise SystemExit(f"data dir not found: {data_dir}")
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
 
-    artworks_path = Path(args.output_artworks)
-    artists_path = Path(args.output_artists)
-    failures_path = Path(args.failures)
-    artworks_path.parent.mkdir(parents=True, exist_ok=True)
-    artists_path.parent.mkdir(parents=True, exist_ok=True)
-    failures_path.parent.mkdir(parents=True, exist_ok=True)
+    entity_types = (
+        ["artwork", "artist", "partner", "show", "fair"]
+        if args.entity == "all"
+        else [args.entity]
+    )
+    outputs = {entity: _output_path(state_dir, entity, args.output_suffix) for entity in entity_types}
+    failures_path = state_dir / f"artsy_parse_failures{args.output_suffix}.jsonl"
 
     resume_keys: set[str] = set()
     if args.resume:
-        resume_keys |= _load_resume_keys(artworks_path)
-        resume_keys |= _load_resume_keys(artists_path)
+        resume_keys = _load_resume_keys(*outputs.values())
 
     mapping_filenames: set[str] | None = None
     if args.mapping_file is not None:
@@ -160,22 +144,24 @@ def main() -> None:
     workers = args.workers or os.cpu_count() or 4
     stats = {
         "scanned": 0,
-        "artworks_ok": 0,
-        "artists_ok": 0,
+        "ok": 0,
         "skipped": 0,
         "missing": 0,
         "failed": 0,
     }
 
     batch_mode = mapping_filenames is not None
-    artwork_mode = "w" if batch_mode else ("a" if args.resume and artworks_path.is_file() else "w")
-    artist_mode = "w" if batch_mode else ("a" if args.resume and artists_path.is_file() else "w")
+    handles = {
+        entity: outputs[entity].open(
+            "w" if batch_mode else ("a" if args.resume and outputs[entity].is_file() else "w"),
+            encoding="utf-8",
+        )
+        for entity in entity_types
+    }
     failure_mode = "w" if batch_mode else ("a" if args.resume and failures_path.is_file() else "w")
 
-    tasks = [(str(path), args.entity, str(data_dir)) for path in files]
+    tasks = [(str(path), args.entity, str(data_dir), "") for path in files]
     with (
-        artworks_path.open(artwork_mode, encoding="utf-8") as artworks_out,
-        artists_path.open(artist_mode, encoding="utf-8") as artists_out,
         failures_path.open(failure_mode, encoding="utf-8") as failures_out,
         ProcessPoolExecutor(max_workers=max(1, workers)) as pool,
     ):
@@ -185,25 +171,20 @@ def main() -> None:
             stats["scanned"] += 1
             status = result.get("status")
             if status == "ok":
-                record = result["record"]
-                line = json.dumps(record, ensure_ascii=False) + "\n"
-                if result["entity_type"] == "artwork":
-                    artworks_out.write(line)
-                    stats["artworks_ok"] += 1
-                else:
-                    artists_out.write(line)
-                    stats["artists_ok"] += 1
-            elif status == "missing":
-                stats["missing"] += 1
-                failures_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-            elif status == "error":
-                stats["failed"] += 1
+                entity_type = result["entity_type"]
+                handles[entity_type].write(json.dumps(result["record"], ensure_ascii=False) + "\n")
+                stats["ok"] += 1
+            elif status in {"missing", "error"}:
+                stats["missing" if status == "missing" else "failed"] += 1
                 failures_out.write(json.dumps(result, ensure_ascii=False) + "\n")
             else:
                 stats["skipped"] += 1
 
             if stats["scanned"] % 5000 == 0:
                 print(f"progress: {json.dumps(stats, ensure_ascii=False)}", flush=True)
+
+    for handle in handles.values():
+        handle.close()
 
     print("summary:", json.dumps(stats, ensure_ascii=False))
 

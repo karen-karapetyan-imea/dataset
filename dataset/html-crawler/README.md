@@ -1,6 +1,6 @@
-# html-crawler
+# Weekly marketplace sync
 
-Standalone HTML crawler and ETL for **Saatchi Art** and **Artsper**. No API dependency.
+Standalone HTML crawler and ETL for **Artsper**, **Saatchi Art**, and **Artsy**.
 
 ## Setup
 
@@ -13,64 +13,117 @@ pip install -r requirements-dev.txt
 
 Copy `proxy.txt` (or set `CRAWLER_PROXY` / `--proxy-file`). Load `DATABASE_URL` from `../.env` for imports.
 
-## Crawl
+## Weekly incremental jobs (remote: intersa)
 
 ```bash
-python main.py \
-  --urls state/urls_saatchi.txt \
-  --output-dir output \
-  --results state/results.jsonl \
-  --proxy-file proxy.txt \
-  --skip-existing
+cd /home/intersa/dataset/dataset/html-crawler
+source .venv/bin/activate
+export ENV_FILE=/home/intersa/dataset/.env
 ```
 
-Flags: `--workers`, `--rps`, `--skip-existing`, `--no-results-append`.
-
-Rebuild URL lists from the backup crawl log:
+### Artsper (Sun 02:00)
 
 ```bash
-python scripts/extract_urls_from_results.py \
-  --results ../crawler_backup/results.jsonl \
-  --output-dir state
+HTML_DIR=/home/intersa/html-crawler/artsper_data \
+URL_SOURCE=sitemap \
+./scripts/sync_artsper_incremental.sh
 ```
 
-## Saatchi pipeline
+Dry-run: `DIFF_ONLY=1 URL_SOURCE=sitemap ./scripts/sync_artsper_incremental.sh`
+
+### Saatchi (Sun 04:00)
 
 ```bash
-# Apply DDL once
-psql "$DATABASE_URL" -f sql/005_saatchi.sql
-
-# Extract HTML -> JSONL
-python store_saatchi_data.py --data-dir output --resume
-
-# Import JSONL -> Postgres
-python import_saatchi_to_db.py \
-  --db-url "$DATABASE_URL" \
-  --html-dir output \
-  --artists-jsonl state/saatchi_artists.jsonl \
-  --artworks-jsonl state/saatchi_artworks.jsonl
-
-# Or all-in-one
-DATA_DIR=output ./scripts/sync_saatchi.sh
+DATA_DIR=/home/intersa/html-crawler/saatchi_data \
+HTML_DIR=/home/intersa/html-crawler/saatchi_data \
+./scripts/sync_saatchi_incremental.sh
 ```
 
-## Artsper pipeline
+Or: `./scripts/run_saatchi_intersa.sh`
+
+### Artsy (Sun 06:00)
 
 ```bash
-# Discover URLs from sitemap
-python scripts/fetch_artsper_sitemap.py --output state/sitemap_urls.txt
+HTML_DIR=/home/intersa/html-crawler/artsy_data \
+./scripts/sync_artsy_incremental.sh
+```
 
-# Crawl
-python main.py --urls state/sitemap_urls.txt --output-dir output --proxy-file proxy.txt
+### Cron template
 
-# Extract
-python store_data.py --data-dir output --urls-file state/sitemap_urls.txt
+```cron
+0 2 * * 0 intersa bash -lc 'cd /home/intersa/dataset/dataset/html-crawler && source .venv/bin/activate && ENV_FILE=/home/intersa/dataset/.env HTML_DIR=/home/intersa/html-crawler/artsper_data URL_SOURCE=sitemap ./scripts/sync_artsper_incremental.sh' >> /var/log/artsper-sync.log 2>&1
+0 4 * * 0 intersa bash -lc 'cd /home/intersa/dataset/dataset/html-crawler && source .venv/bin/activate && ENV_FILE=/home/intersa/dataset/.env DATA_DIR=/home/intersa/html-crawler/saatchi_data ./scripts/sync_saatchi_incremental.sh' >> /var/log/saatchi-sync.log 2>&1
+0 6 * * 0 intersa bash -lc 'cd /home/intersa/dataset/dataset/html-crawler && source .venv/bin/activate && ENV_FILE=/home/intersa/dataset/.env HTML_DIR=/home/intersa/html-crawler/artsy_data ./scripts/sync_artsy_incremental.sh' >> /var/log/artsy-sync.log 2>&1
+```
 
-# Import to legacy arts_* tables
-python import_to_legacy_db.py \
-  --db-url "$DATABASE_URL" \
-  --html-dir output \
-  --mapping-file state/results.jsonl
+## Validation checklist
+
+1. `DIFF_ONLY=1` — review `state/{marketplace}/sitemap_diff.json`
+2. Crawl completes — `results_new.jsonl` line count matches `urls_new.txt`
+3. DB counts increase — `SELECT COUNT(*) FROM ...`
+4. Import logs show `versioned=N` when prices changed; second run `versioned≈0`
+5. Next-day `DIFF_ONLY=1` — near-zero new URLs
+
+## Per-marketplace state dirs
+
+| Marketplace | State dir | Sitemap script |
+|-------------|-----------|----------------|
+| Artsper | `state/artsper/` | `fetch_artsper_sitemap.sh` |
+| Saatchi | `state/saatchi/` | `fetch_saatchi_sitemap.sh` |
+| Artsy | `state/artsy/` | `fetch_artsy_sitemap.sh` |
+
+## Phase flags (all incremental scripts)
+
+| Flag | Effect |
+|------|--------|
+| `DIFF_ONLY=1` | Sitemap diff report only |
+| `SCRAPE_ONLY=1` | Diff + crawl, skip import |
+| `EXTRACT_ONLY=1` | Skip import (Saatchi/Artsy) |
+| `IMPORT_ONLY=1` | Import latest results only |
+| `SYNC_VERSIONS=1` | Compare batch vs DB, write `marketplace_entity_versions` on change (cron default) |
+| `SKIP_EXISTING=1` | Bulk import: insert new IDs only, no version history |
+| `SKIP_EXISTING=0` | Upsert rows even if id exists (no version history) |
+| `SKIP_DDL=1` | Skip applying `sql/007_marketplace_versions.sql` |
+
+## Entity versioning
+
+Weekly crons default to `SYNC_VERSIONS=1`. Each run:
+
+1. Sitemap diff finds new + lastmod-changed URLs
+2. Crawl re-fetches those URLs (no `--skip-existing` on the incremental batch)
+3. Extract writes batch JSONL (`*_batch.jsonl` for Saatchi/Artsy)
+4. Import compares tracked fields vs current DB row
+5. On change: append to `marketplace_entity_versions` and update the current table
+
+Apply DDL once (or let sync scripts apply it):
+
+```bash
+psql "$DATABASE_URL" -f sql/007_marketplace_versions.sql
+```
+
+Example: price history for a Saatchi artwork:
+
+```sql
+SELECT entity_id, version_no,
+       previous_snapshot->>'price' AS old_price,
+       current_snapshot->>'price' AS new_price,
+       changed_fields,
+       observed_at
+FROM marketplace_entity_versions
+WHERE marketplace = 'saatchi' AND entity_type = 'artwork' AND entity_id = '9336593'
+ORDER BY version_no;
+```
+
+Bulk first-time import (e.g. large JSONL on intersa without a crawl batch):
+
+```bash
+IMPORT_ONLY=1 SKIP_EXISTING=1 SYNC_VERSIONS=0 ./scripts/sync_saatchi_incremental.sh
+```
+
+## Full batch Saatchi (legacy)
+
+```bash
+DATA_DIR=output RESUME=1 ./scripts/sync_saatchi.sh
 ```
 
 ## Tests
@@ -78,3 +131,7 @@ python import_to_legacy_db.py \
 ```bash
 pytest
 ```
+
+## Artsy schema
+
+See [docs/artsy_schema.md](docs/artsy_schema.md) and `sql/006_artsy.sql`.

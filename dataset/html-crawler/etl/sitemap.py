@@ -16,8 +16,18 @@ from etl.url_registry import entity_key_from_url, load_entity_keys, normalize_ur
 LOGGER = logging.getLogger(__name__)
 
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
-DEFAULT_INDEX = "https://www.artsper.com/sitemap.xml"
+DEFAULT_ARTSPER_INDEX = "https://www.artsper.com/sitemap.xml"
+DEFAULT_INDEX = DEFAULT_ARTSPER_INDEX
+DEFAULT_SAATCHI_INDEX = "https://www.saatchiart.com/sitemap.xml"
+DEFAULT_ARTSY_SITEMAPS = (
+    "https://www.artsy.net/sitemap-artworks.xml",
+    "https://www.artsy.net/sitemap-artists.xml",
+    "https://www.artsy.net/sitemap-partners.xml",
+    "https://www.artsy.net/sitemap-shows.xml",
+    "https://www.artsy.net/sitemap-fairs.xml",
+)
 _ARTSPER_CHILD_RE = ("artist", "artwork")
+_SAATCHI_CHILD_RE = ("artwork", "artist", "profile")
 
 
 def _tag(local: str) -> str:
@@ -61,13 +71,21 @@ def parse_child_sitemap_locs(xml_bytes: bytes) -> list[str]:
     return [url for url, _ in parse_url_entries(xml_bytes)]
 
 
-def filter_artsper_child_sitemaps(urls: Iterable[str]) -> list[str]:
+def filter_child_sitemaps(urls: Iterable[str], tokens: tuple[str, ...]) -> list[str]:
     selected: list[str] = []
     for url in urls:
         lower = url.lower()
-        if any(token in lower for token in _ARTSPER_CHILD_RE):
+        if any(token in lower for token in tokens):
             selected.append(url)
     return selected
+
+
+def filter_artsper_child_sitemaps(urls: Iterable[str]) -> list[str]:
+    return filter_child_sitemaps(urls, _ARTSPER_CHILD_RE)
+
+
+def filter_saatchi_child_sitemaps(urls: Iterable[str]) -> list[str]:
+    return filter_child_sitemaps(urls, _SAATCHI_CHILD_RE)
 
 
 @dataclass(slots=True)
@@ -147,22 +165,28 @@ def fetch_sitemap_bytes(client: httpx.Client, url: str) -> bytes:
     return response.content
 
 
-def fetch_artsper_sitemap_entries(
-    index_url: str = DEFAULT_INDEX,
+def fetch_sitemap_entries_from_urls(
+    sitemap_urls: Iterable[str],
     *,
+    source: str,
     concurrency: int = 8,
     client: httpx.Client | None = None,
 ) -> list[SitemapEntry]:
     own_client = client is None
-    http = client or httpx.Client(http2=True, headers={"User-Agent": "artsper-sitemap-fetch/1.0"})
+    http = client or httpx.Client(http2=True, headers={"User-Agent": f"{source}-sitemap-fetch/1.0"})
+    entries: list[SitemapEntry] = []
     try:
-        index_xml = fetch_sitemap_bytes(http, index_url)
-        child_urls = filter_artsper_child_sitemaps(parse_child_sitemap_locs(index_xml))
-        LOGGER.info("artsper sitemap child maps=%s", len(child_urls))
+        all_child_urls: list[str] = []
+        for sitemap_url in sitemap_urls:
+            index_xml = fetch_sitemap_bytes(http, sitemap_url)
+            child_locs = parse_child_sitemap_locs(index_xml)
+            if child_locs and child_locs != [url for url, _ in parse_url_entries(index_xml)]:
+                all_child_urls.extend(child_locs)
+            else:
+                all_child_urls.append(sitemap_url)
 
-        entries: list[SitemapEntry] = []
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            futures = {pool.submit(fetch_sitemap_bytes, http, child_url): child_url for child_url in child_urls}
+            futures = {pool.submit(fetch_sitemap_bytes, http, child_url): child_url for child_url in all_child_urls}
             for future in as_completed(futures):
                 child_url = futures[future]
                 try:
@@ -172,7 +196,7 @@ def fetch_artsper_sitemap_entries(
                     continue
                 for url, lastmod in parse_url_entries(xml_bytes):
                     normalized = normalize_url(url)
-                    key = entity_key_from_url(normalized)
+                    key = entity_key_from_url(normalized, source=source)
                     if key is None:
                         continue
                     entity_type, entity_id = key
@@ -188,6 +212,70 @@ def fetch_artsper_sitemap_entries(
     finally:
         if own_client:
             http.close()
+
+
+def fetch_artsper_sitemap_entries(
+    index_url: str = DEFAULT_ARTSPER_INDEX,
+    *,
+    concurrency: int = 8,
+    client: httpx.Client | None = None,
+) -> list[SitemapEntry]:
+    own_client = client is None
+    http = client or httpx.Client(http2=True, headers={"User-Agent": "artsper-sitemap-fetch/1.0"})
+    try:
+        index_xml = fetch_sitemap_bytes(http, index_url)
+        child_urls = filter_artsper_child_sitemaps(parse_child_sitemap_locs(index_xml))
+        LOGGER.info("artsper sitemap child maps=%s", len(child_urls))
+        return fetch_sitemap_entries_from_urls(
+            child_urls,
+            source="artsper",
+            concurrency=concurrency,
+            client=http,
+        )
+    finally:
+        if own_client:
+            http.close()
+
+
+def fetch_saatchi_sitemap_entries(
+    index_url: str = DEFAULT_SAATCHI_INDEX,
+    *,
+    concurrency: int = 8,
+    client: httpx.Client | None = None,
+) -> list[SitemapEntry]:
+    own_client = client is None
+    http = client or httpx.Client(http2=True, headers={"User-Agent": "saatchi-sitemap-fetch/1.0"})
+    try:
+        index_xml = fetch_sitemap_bytes(http, index_url)
+        child_urls = filter_saatchi_child_sitemaps(parse_child_sitemap_locs(index_xml))
+        if not child_urls:
+            child_urls = [index_url]
+        LOGGER.info("saatchi sitemap child maps=%s", len(child_urls))
+        return fetch_sitemap_entries_from_urls(
+            child_urls,
+            source="saatchi",
+            concurrency=concurrency,
+            client=http,
+        )
+    finally:
+        if own_client:
+            http.close()
+
+
+def fetch_artsy_sitemap_entries(
+    sitemap_urls: Iterable[str] = DEFAULT_ARTSY_SITEMAPS,
+    *,
+    concurrency: int = 8,
+    client: httpx.Client | None = None,
+) -> list[SitemapEntry]:
+    urls = list(sitemap_urls)
+    LOGGER.info("artsy sitemap indexes=%s", len(urls))
+    return fetch_sitemap_entries_from_urls(
+        urls,
+        source="artsy",
+        concurrency=concurrency,
+        client=client,
+    )
 
 
 def diff_sitemap_entries(

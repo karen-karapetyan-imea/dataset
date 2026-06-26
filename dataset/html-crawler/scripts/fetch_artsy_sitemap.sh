@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Fetch Artsper artist/artwork URLs from https://www.artsper.com/sitemap.xml
-# and write only new/updated entities to state/artsper/urls_new.txt.
+# Fetch Artsy catalog URLs from sitemap indexes.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,15 +13,13 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   done
 fi
 
-STATE_DIR="${STATE_DIR:-state/artsper}"
-INDEX="${SITEMAP_URL:-https://www.artsper.com/sitemap.xml}"
+STATE_DIR="${STATE_DIR:-state/artsy}"
 KNOWN="${KNOWN_URLS:-results.jsonl}"
 
 source "${VENV:-$ROOT/.venv}/bin/activate" 2>/dev/null || true
 
 ARGS=(
-  --source artsper
-  --index "$INDEX"
+  --source artsy
   --known "$KNOWN"
   --out-all "$STATE_DIR/sitemap_urls.txt"
   --out-new "$STATE_DIR/urls_new.txt"
