@@ -1,0 +1,4 @@
+pyspark==3.5.4
+delta-spark==3.2.1
+pyarrow>=15.0
+zstandard>=0.22

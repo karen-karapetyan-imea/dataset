@@ -1,0 +1,30 @@
+services:
+  spark:
+    # Bitnami's Spark image tags are versioned; `3.5` is not a valid manifest tag.
+    # Use an existing immutable tag so `docker compose up` can pull reliably.
+    # Bitnami moved older Spark images to `bitnamilegacy/` on Docker Hub.
+    # The `bitnami/spark:*` repo in your environment returns "manifest unknown".
+    image: bitnamilegacy/spark:3.5.4-debian-12-r6
+    container_name: lakehouse-spark
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_USER=spark
+      - PYSPARK_PYTHON=python3
+      - LAKEHOUSE_DATA_ROOT=/data
+      - HTML_CRAWLER_ROOT=/data/html-crawler
+      - SPARK_MASTER=local[*]
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+    volumes:
+      - .:/data
+    working_dir: /data
+    ports:
+      - "4040:4040"
+      - "7077:7077"
+    command: >
+      bash -c "pip install --no-cache-dir -r /data/lakehouse/requirements.txt &&
+      tail -f /dev/null"

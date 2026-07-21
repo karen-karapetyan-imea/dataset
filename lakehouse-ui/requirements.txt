@@ -1,0 +1,4 @@
+streamlit>=1.32
+deltalake>=0.18
+pyarrow>=15.0
+pandas>=2.0
