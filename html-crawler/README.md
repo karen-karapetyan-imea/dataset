@@ -17,7 +17,7 @@ Copy `proxy.txt` (or set `CRAWLER_PROXY` / `--proxy-file`). Load `DATABASE_URL` 
 
 ```bash
 python main.py \
-  --urls state/urls_saatchi.txt \
+  --urls state/urls_saatchiart.txt \
   --output-dir output \
   --results state/results.jsonl \
   --proxy-file proxy.txt \
@@ -37,6 +37,25 @@ python scripts/extract_urls_from_results.py \
 ## Saatchi pipeline
 
 ```bash
+# Discover URLs from sitemap (all entity URLs)
+python scripts/fetch_saatchi_sitemap.py --out-all state/urls_saatchiart.txt
+
+# Or via wrapper
+./scripts/fetch_saatchi_sitemap.sh
+
+# Incremental: new + updated URLs only
+python scripts/fetch_saatchi_sitemap.py \
+  --known state/results.jsonl \
+  --update-state
+
+# Crawl
+python main.py \
+  --urls state/urls_saatchiart.txt \
+  --output-dir output \
+  --results state/results.jsonl \
+  --proxy-file proxy.txt \
+  --skip-existing
+
 # Apply DDL once
 psql "$DATABASE_URL" -f sql/005_saatchi.sql
 psql "$DATABASE_URL" -f sql/006_entity_history.sql
@@ -57,6 +76,8 @@ python import_saatchi_to_db.py \
 DATA_DIR=output ./scripts/sync_saatchi.sh
 ```
 
+Outputs: `state/urls_saatchiart.txt` (all), `state/urls_saatchi_new.txt` (diff), `state/saatchi_sitemap_diff.json`.
+
 ## Artsper pipeline
 
 ```bash
@@ -66,7 +87,7 @@ DATA_DIR=output ./scripts/sync_saatchi.sh
 #   psql "$DATABASE_URL" -f sql/007_arts_urls.sql
 
 # Discover URLs from sitemap
-python scripts/fetch_artsper_sitemap.py --output state/sitemap_urls.txt
+python scripts/fetch_artsper_sitemap.py --out-all state/sitemap_urls.txt
 
 # Crawl
 python main.py --urls state/sitemap_urls.txt --output-dir output --proxy-file proxy.txt

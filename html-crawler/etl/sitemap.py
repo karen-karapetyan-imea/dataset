@@ -14,16 +14,18 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from etl.url_registry import entity_key_from_url, load_entity_keys, load_urls, normalize_url
-from etl.urls import artsy_entity_from_url
+from etl.urls import artsy_entity_from_url, saatchi_entity_from_url
 
 LOGGER = logging.getLogger(__name__)
 
 SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 DEFAULT_INDEX = "https://www.artsper.com/sitemap.xml"
+DEFAULT_SAATCHI_INDEX = "https://www.saatchiart.com/sitemap.xml"
 ARTSY_ARTIST_INDEX = "https://www.artsy.net/sitemap-artists.xml"
 ARTSY_ARTWORK_INDEX = "https://www.artsy.net/sitemap-artworks.xml"
 DEFAULT_ARTSY_INDEXES = (ARTSY_ARTIST_INDEX, ARTSY_ARTWORK_INDEX)
 _ARTSPER_CHILD_RE = ("artist", "artwork")
+_SAATCHI_CHILD_RE = ("artwork", "profile")
 
 FetchBytesFn = Callable[[str], bytes]
 
@@ -89,6 +91,15 @@ def filter_artsper_child_sitemaps(urls: Iterable[str]) -> list[str]:
     for url in urls:
         lower = url.lower()
         if any(token in lower for token in _ARTSPER_CHILD_RE):
+            selected.append(url)
+    return selected
+
+
+def filter_saatchi_child_sitemaps(urls: Iterable[str]) -> list[str]:
+    selected: list[str] = []
+    for url in urls:
+        lower = url.lower()
+        if any(token in lower for token in _SAATCHI_CHILD_RE):
             selected.append(url)
     return selected
 
@@ -258,6 +269,51 @@ def fetch_artsper_sitemap_entries(
             http.close()
 
 
+def fetch_saatchi_sitemap_entries(
+    index_url: str = DEFAULT_SAATCHI_INDEX,
+    *,
+    concurrency: int = 8,
+    client: httpx.Client | None = None,
+) -> list[SitemapEntry]:
+    own_client = client is None
+    http = client or httpx.Client(http2=True, headers={"User-Agent": "saatchi-sitemap-fetch/1.0"})
+    try:
+        index_xml = fetch_sitemap_bytes(http, index_url)
+        child_urls = filter_saatchi_child_sitemaps(parse_child_sitemap_locs(index_xml))
+        if not child_urls:
+            child_urls = [index_url]
+        LOGGER.info("saatchi sitemap child maps=%s", len(child_urls))
+
+        entries: list[SitemapEntry] = []
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            futures = {pool.submit(fetch_sitemap_bytes, http, child_url): child_url for child_url in child_urls}
+            for future in as_completed(futures):
+                child_url = futures[future]
+                try:
+                    xml_bytes = future.result()
+                except Exception as exc:
+                    LOGGER.warning("child sitemap failed url=%s error=%s", child_url, exc)
+                    continue
+                for url, lastmod in parse_url_entries(xml_bytes):
+                    normalized = normalize_url(url)
+                    key = saatchi_entity_from_url(normalized)
+                    if key is None:
+                        continue
+                    entity_type, entity_id = key
+                    entries.append(
+                        SitemapEntry(
+                            url=normalized,
+                            lastmod=lastmod,
+                            entity_type=entity_type,
+                            entity_id=entity_id,
+                        )
+                    )
+        return entries
+    finally:
+        if own_client:
+            http.close()
+
+
 def _collect_artsy_urlset_xml(
     index_urls: Iterable[str],
     *,
@@ -365,6 +421,16 @@ def known_artsy_keys_from_paths(paths: Iterable[Path]) -> set[tuple[str, str]]:
     return keys
 
 
+def known_saatchi_keys_from_paths(paths: Iterable[Path]) -> set[tuple[str, str]]:
+    """Load known Saatchi entity keys from URL list / JSONL files."""
+    keys: set[tuple[str, str]] = set()
+    for url in load_urls(paths):
+        key = saatchi_entity_from_url(url)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
 def diff_sitemap_entries(
     entries: Iterable[SitemapEntry],
     *,
@@ -453,6 +519,8 @@ def known_keys_from_sources(
     if known_paths:
         if source == "artsy":
             keys |= known_artsy_keys_from_paths(known_paths)
+        elif source == "saatchi":
+            keys |= known_saatchi_keys_from_paths(known_paths)
         else:
             keys |= load_entity_keys(known_paths)
     if known_db_url:

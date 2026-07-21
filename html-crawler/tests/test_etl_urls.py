@@ -4,6 +4,7 @@ from etl.urls import (
     artsy_entity_from_url,
     saatchi_artist_from_url,
     saatchi_artwork_from_url,
+    saatchi_entity_from_url,
 )
 
 
@@ -28,6 +29,23 @@ def test_saatchi_artwork_url() -> None:
 def test_saatchi_artist_url() -> None:
     url = "https://www.saatchiart.com/account/profile/735695"
     assert saatchi_artist_from_url(url) == "735695"
+
+
+def test_saatchi_entity_artwork_url() -> None:
+    url = (
+        "https://www.saatchiart.com/art/Painting-Test/735695/9336593/view"
+    )
+    assert saatchi_entity_from_url(url) == ("artwork", "9336593")
+
+
+def test_saatchi_entity_artist_profile_url() -> None:
+    url = "https://www.saatchiart.com/account/profile/735695"
+    assert saatchi_entity_from_url(url) == ("artist", "735695")
+
+
+def test_saatchi_entity_artist_username_url() -> None:
+    url = "https://www.saatchiart.com/radeksmach"
+    assert saatchi_entity_from_url(url) == ("artist", "radeksmach")
 
 
 def test_artist_external_id_from_creator_url() -> None:

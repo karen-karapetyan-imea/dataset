@@ -92,25 +92,37 @@ def load_entity_keys(paths: Iterable[Path]) -> set[tuple[str, str]]:
     return keys
 
 
+_MARKETPLACE_TABLES: dict[str, dict[str, str]] = {
+    "artsper": {
+        "artist": "arts_artists",
+        "artwork": "arts_artworks",
+    },
+    "saatchi": {
+        "artist": "saatchi_artists",
+        "artwork": "saatchi_artworks",
+    },
+}
+
+
 def load_entity_keys_from_db(db_url: str, *, source: str = "artsper") -> set[tuple[str, str]]:
-    """Load known Artsper entity ids from legacy arts_* tables."""
-    del source  # legacy schema is Artsper-only
+    """Load known entity ids from marketplace tables."""
     try:
         import psycopg
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("psycopg is required for --known-db-url") from exc
 
+    tables = _MARKETPLACE_TABLES.get(source)
+    if tables is None:
+        raise ValueError(f"unsupported marketplace source: {source}")
+
     keys: set[tuple[str, str]] = set()
     with psycopg.connect(db_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT id::text FROM public.arts_artists")
-            for (external_id,) in cursor.fetchall():
-                if external_id is not None:
-                    keys.add(("artist", str(external_id)))
-            cursor.execute("SELECT id::text FROM public.arts_artworks")
-            for (external_id,) in cursor.fetchall():
-                if external_id is not None:
-                    keys.add(("artwork", str(external_id)))
+            for entity_type, table_name in tables.items():
+                cursor.execute(f"SELECT id::text FROM public.{table_name}")
+                for (external_id,) in cursor.fetchall():
+                    if external_id is not None:
+                        keys.add((entity_type, str(external_id)))
     return keys
 
 

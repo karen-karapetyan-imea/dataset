@@ -17,12 +17,30 @@ SAATCHI_ARTWORK_RE = re.compile(
     re.IGNORECASE,
 )
 SAATCHI_ARTIST_PROFILE_RE = re.compile(
-    r"saatchiart\.com/(?:account/profile/|)([a-z0-9_-]+)/?$",
+    r"saatchiart\.com/account/profile/([a-z0-9_-]+)/?$",
     re.IGNORECASE,
 )
 SAATCHI_ARTIST_ID_RE = re.compile(
     r"saatchiart\.com/(?:account/profile/)?(\d+)/?$",
     re.IGNORECASE,
+)
+SAATCHI_USERNAME_RE = re.compile(
+    r"saatchiart\.com/([a-z0-9_-]+)/?$",
+    re.IGNORECASE,
+)
+
+_SAATCHI_RESERVED = frozenset(
+    {
+        "art",
+        "account",
+        "accounts",
+        "search",
+        "collections",
+        "stories",
+        "magazine",
+        "api",
+        "www",
+    }
 )
 # Exact entity pages only: /artist/<slug> or /artwork/<slug> (no nested paths).
 ARTSY_ARTWORK_RE = re.compile(
@@ -62,6 +80,25 @@ def saatchi_artist_from_url(url: str) -> str | None:
     profile = SAATCHI_ARTIST_PROFILE_RE.search(url)
     if profile and profile.group(1).isdigit():
         return profile.group(1)
+    return None
+
+
+def saatchi_entity_from_url(url: str) -> tuple[str, str] | None:
+    """Return ('artwork'|'artist', external_id) for Saatchi entity URLs."""
+    artwork = saatchi_artwork_from_url(url)
+    if artwork:
+        return "artwork", artwork[1]
+    artist_id = saatchi_artist_from_url(url)
+    if artist_id:
+        return "artist", artist_id
+    profile = SAATCHI_ARTIST_PROFILE_RE.search(url)
+    if profile:
+        return "artist", profile.group(1)
+    username = SAATCHI_USERNAME_RE.search(url)
+    if username:
+        slug = username.group(1).lower()
+        if slug not in _SAATCHI_RESERVED:
+            return "artist", slug
     return None
 
 
