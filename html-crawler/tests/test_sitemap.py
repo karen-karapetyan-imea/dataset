@@ -184,7 +184,7 @@ def test_fetch_saatchi_sitemap_entries() -> None:
         "https://www.saatchiart.com/sitemap-profiles-1.xml": SAATCHI_PROFILES_URLSET,
     }
 
-    def fake_fetch(_client: object, url: str) -> bytes:
+    def fake_fetch(_client: object, url: str, **kwargs: object) -> bytes:
         return fixtures[url]
 
     with patch("etl.sitemap.fetch_sitemap_bytes", side_effect=fake_fetch):

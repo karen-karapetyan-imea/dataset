@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import random
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ ARTSY_ARTWORK_INDEX = "https://www.artsy.net/sitemap-artworks.xml"
 DEFAULT_ARTSY_INDEXES = (ARTSY_ARTIST_INDEX, ARTSY_ARTWORK_INDEX)
 _ARTSPER_CHILD_RE = ("artist", "artwork")
 _SAATCHI_CHILD_RE = ("artwork", "profile")
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 FetchBytesFn = Callable[[str], bytes]
 
@@ -175,10 +178,42 @@ def _entity_state_key(entity_type: str, entity_id: str) -> str:
     return f"{entity_type}:{entity_id}"
 
 
-def fetch_sitemap_bytes(client: httpx.Client, url: str) -> bytes:
-    response = client.get(url, timeout=60.0, follow_redirects=True)
-    response.raise_for_status()
-    return response.content
+def fetch_sitemap_bytes(
+    client: httpx.Client,
+    url: str,
+    *,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+) -> bytes:
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = client.get(url, timeout=60.0, follow_redirects=True)
+            if response.status_code in _RETRYABLE_STATUS:
+                response.raise_for_status()
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code not in _RETRYABLE_STATUS or attempt + 1 >= max_retries:
+                raise
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 >= max_retries:
+                raise
+        delay = base_delay * (2**attempt) + random.uniform(0, 0.5)
+        LOGGER.warning(
+            "sitemap fetch retry url=%s attempt=%s/%s sleep=%.1fs error=%s",
+            url,
+            attempt + 1,
+            max_retries,
+            delay,
+            last_exc,
+        )
+        time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"failed to fetch sitemap url={url}")
 
 
 def _maybe_decompress(url: str, body: bytes) -> bytes:
@@ -269,45 +304,93 @@ def fetch_artsper_sitemap_entries(
             http.close()
 
 
+def _entries_from_saatchi_urlset(xml_bytes: bytes) -> list[SitemapEntry]:
+    entries: list[SitemapEntry] = []
+    for url, lastmod in parse_url_entries(xml_bytes):
+        normalized = normalize_url(url)
+        key = saatchi_entity_from_url(normalized)
+        if key is None:
+            continue
+        entity_type, entity_id = key
+        entries.append(
+            SitemapEntry(
+                url=normalized,
+                lastmod=lastmod,
+                entity_type=entity_type,
+                entity_id=entity_id,
+            )
+        )
+    return entries
+
+
+def _fetch_saatchi_child_batch(
+    http: httpx.Client,
+    child_urls: list[str],
+    *,
+    concurrency: int,
+    max_retries: int = 5,
+) -> tuple[list[SitemapEntry], list[str]]:
+    entries: list[SitemapEntry] = []
+    failed: list[str] = []
+
+    def fetch_one(child_url: str) -> tuple[str, bytes | None]:
+        try:
+            return child_url, fetch_sitemap_bytes(http, child_url, max_retries=max_retries)
+        except Exception as exc:
+            LOGGER.warning("child sitemap failed url=%s error=%s", child_url, exc)
+            return child_url, None
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = {pool.submit(fetch_one, child_url): child_url for child_url in child_urls}
+        for future in as_completed(futures):
+            child_url, xml_bytes = future.result()
+            if xml_bytes is None:
+                failed.append(child_url)
+                continue
+            entries.extend(_entries_from_saatchi_urlset(xml_bytes))
+    return entries, failed
+
+
 def fetch_saatchi_sitemap_entries(
     index_url: str = DEFAULT_SAATCHI_INDEX,
     *,
-    concurrency: int = 8,
+    concurrency: int = 3,
     client: httpx.Client | None = None,
 ) -> list[SitemapEntry]:
     own_client = client is None
-    http = client or httpx.Client(http2=True, headers={"User-Agent": "saatchi-sitemap-fetch/1.0"})
+    http = client or httpx.Client(
+        http2=False,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; SaatchiSitemapFetcher/1.0; "
+                "+https://www.saatchiart.com/sitemap.xml)"
+            ),
+            "Accept": "application/xml,text/xml,*/*",
+        },
+    )
     try:
         index_xml = fetch_sitemap_bytes(http, index_url)
         child_urls = filter_saatchi_child_sitemaps(parse_child_sitemap_locs(index_xml))
         if not child_urls:
             child_urls = [index_url]
-        LOGGER.info("saatchi sitemap child maps=%s", len(child_urls))
+        LOGGER.info("saatchi sitemap child maps=%s concurrency=%s", len(child_urls), concurrency)
 
-        entries: list[SitemapEntry] = []
-        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            futures = {pool.submit(fetch_sitemap_bytes, http, child_url): child_url for child_url in child_urls}
-            for future in as_completed(futures):
-                child_url = futures[future]
-                try:
-                    xml_bytes = future.result()
-                except Exception as exc:
-                    LOGGER.warning("child sitemap failed url=%s error=%s", child_url, exc)
-                    continue
-                for url, lastmod in parse_url_entries(xml_bytes):
-                    normalized = normalize_url(url)
-                    key = saatchi_entity_from_url(normalized)
-                    if key is None:
-                        continue
-                    entity_type, entity_id = key
-                    entries.append(
-                        SitemapEntry(
-                            url=normalized,
-                            lastmod=lastmod,
-                            entity_type=entity_type,
-                            entity_id=entity_id,
-                        )
-                    )
+        entries, failed = _fetch_saatchi_child_batch(http, child_urls, concurrency=concurrency)
+        if failed:
+            LOGGER.info("saatchi sitemap retrying failed child maps=%s (serial)", len(failed))
+            retry_entries, still_failed = _fetch_saatchi_child_batch(
+                http,
+                failed,
+                concurrency=1,
+                max_retries=8,
+            )
+            entries.extend(retry_entries)
+            if still_failed:
+                LOGGER.error(
+                    "saatchi sitemap still failed count=%s sample=%s",
+                    len(still_failed),
+                    still_failed[:5],
+                )
         return entries
     finally:
         if own_client:

@@ -30,7 +30,7 @@ LOGGER = logging.getLogger(__name__)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch Saatchi artist/artwork URLs from sitemap.xml")
     parser.add_argument("--index", default=DEFAULT_SAATCHI_INDEX, help="Sitemap index URL")
-    parser.add_argument("--concurrency", type=int, default=8, help="Parallel child-sitemap fetches")
+    parser.add_argument("--concurrency", type=int, default=3, help="Parallel child-sitemap fetches (default 3)")
     parser.add_argument("--known", nargs="*", type=Path, default=(), help="Known crawl sources (results.jsonl)")
     parser.add_argument("--known-db-url", default=None, help="Also treat saatchi_* table ids as known")
     parser.add_argument(
